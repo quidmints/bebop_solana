@@ -1,4 +1,3 @@
-
 // JAM Settlement — Solana
 //
 // Minimal implementation of Bebop's Aggregation API settlement on Solana.
@@ -8,9 +7,10 @@
 //
 // settle() flow (from JamSettlement.sol):
 //   1. validateOrder — sig, nonce, expiry, executor
-//   2. transferTokens — sell tokens taker → custody (balanceRecipient equivalent)
+//   2. transferTokens — sell tokens taker → custody
 //   3. runInteractions — solver routes, delivers buy tokens to custody
 //   4. transferTokensFromContract — buy tokens custody → receiver (enforces minimums)
+//   5. transferSellToSolver — sell tokens custody → solver (EVM parity; after buy verified)
 
 use anchor_lang::prelude::*;
 
@@ -118,3 +118,9 @@ pub struct UpdateConfig<'info> {
 // at settlement time. Once now > record.expiry the order can no longer be settled
 // (expiry check would reject it), making the nonce_record inert and safe to close.
 //
+// Using settled_at + constant (e.g. 7 days) would be UNSAFE: an order settled early
+// within a 30-day validity window could have its nonce_record closed while the order
+// is still valid, reopening a replay window. record.expiry is the correct condition.
+// CloseNonceRecord is defined in instructions::settle with params.
+// Re-exported here via `use instructions::*` above.
+

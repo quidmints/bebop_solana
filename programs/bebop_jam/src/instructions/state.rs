@@ -37,8 +37,6 @@ pub const JAM_CONFIG_SEED: &[u8] = b"jam_config";
 pub const JAM_AUTHORITY_SEED: &[u8] = b"jam_authority";
 pub const NONCE_SEED: &[u8] = b"nonce";
 pub const CUSTODY_SEED: &[u8] = b"custody";
-/// Per-taker reentrancy guard seed. See SettleLock below.
-pub const SETTLE_LOCK_SEED: &[u8] = b"settle-lock";
 
 // ─── SolanaJamOrder ───────────────────────────────────────────────────────────
 // Matches JamOrderLib.sol ORDER_TYPE exactly (confirmed from EIP-712 type string):
@@ -70,10 +68,10 @@ pub struct SolanaJamOrder {
     pub exclusivity_deadline: Option<i64>,  // 0 = no exclusivity
     pub nonce: u64,
     pub executor: Option<Pubkey>,   // None = anyone may settle
-    /// Partner fee in bps (replaces EVM's packed partner_info: u256).
-    /// On Solana, partner address is in the separate `partner: Option<Pubkey>` field,
-    /// so the address bits of partner_info are unused — encoding just the fee saves 6 bytes.
-    pub partner_fee_bps: u16,          // packed [partnerAddress(low32), partnerFeeBps, protocolFeeBps]
+    /// Partner fee in basis points (0–10_000). Replaces EVM's packed partner_info: u256
+    /// where bits 16-31 encoded the fee and bits 32+ encoded the partner address.
+    /// On Solana the address lives in `partner: Option<Pubkey>` — separate field, no packing.
+    pub partner_fee_bps: u16,          // bps, 0–10_000
     pub partner: Option<Pubkey>,    // Solana addition: full partner address
     pub sell_tokens: Vec<Pubkey>,   // native SOL = native_mint::ID
     pub buy_tokens: Vec<Pubkey>,    // native SOL = native_mint::ID
@@ -125,9 +123,9 @@ pub struct SolanaInteraction {
     pub use_jam_authority: bool,
 }
 
-/// One account in a CPI, referenced by index into remaining_accounts.
-/// u16 index (2 bytes) replaces Pubkey (32 bytes): saves 30 bytes per interaction account.
-/// 5 interactions × 5 accounts: 750 bytes saved → complex arb fits in Solana's 1232-byte tx limit.
+/// One account in a CPI, referenced by u8 index into remaining_accounts.
+/// u8 index (1 byte) + flags byte replaces Pubkey (32 bytes): saves 30 bytes per account.
+/// 5 interactions × 5 accounts × 30 bytes = 750 bytes saved → complex arb fits in 1232-byte tx.
 impl SolanaJamOrder {
     /// Resolves receiver: None means the taker receives the buy tokens.
     #[inline] pub fn effective_receiver(&self) -> Pubkey {
@@ -226,7 +224,8 @@ pub struct JamConfig {
     /// a different multisig, or the same vault — governance and revenue are
     /// independent concerns.
     pub treasury: Pubkey,
-    /// Bebop's per-settlement cut in bps (EVM: JamOrder.partnerInfo bits 0-15).
+    /// Bebop's per-settlement cut in bps (EVM: packed into partnerInfo bits 0-15;
+    /// Solana: separate field for clarity).
     /// Defaults to 0 on Solana — primary revenue flows through QU!D's kickback,
     /// not per-swap JAM fees. Kept for EVM parity; activate via admin if needed.
     pub protocol_fee_bps: u16,
@@ -234,7 +233,10 @@ pub struct JamConfig {
 }
 
 impl JamConfig {
-    pub const SPACE: usize = 8 + 32 + 32 + 1 + 2 + 2 + 1; // -32: jam_authority removed (derivable)
+    // discriminator(8) + admin(32) + treasury(32) + authority_bump(1) + bump(1)
+    // + min_share_bps(2) + protocol_fee_bps(2) = 78 bytes
+    // jam_authority Pubkey was removed (derivable from seeds; never read from config)
+    pub const SPACE: usize = 8 + 32 + 32 + 1 + 1 + 2 + 2;
 }
 
 // ─── Events ───────────────────────────────────────────────────────────────────
@@ -270,16 +272,3 @@ impl NonceRecord {
     pub const SPACE: usize = 8 + 8 + 1; // discriminator + expiry + bump = 17 bytes
 }
 
-// ─── SettleLock ───────────────────────────────────────────────────────────────
-// Per-taker reentrancy guard. Created (init) at the entry of handle_settle /
-// handle_settle_internal and closed (rent returned to solver) at exit.
-// Prevents a malicious interaction from calling back into JAM with the same
-// taker's propagated signer status (Solana CPI chains preserve signer bits).
-// Seeds: [SETTLE_LOCK_SEED, order.taker]
-#[account]
-pub struct SettleLock {
-    pub bump: u8,
-}
-impl SettleLock {
-    pub const SPACE: usize = 8 + 1; // discriminator + bump
-}

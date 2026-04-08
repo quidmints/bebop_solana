@@ -32,7 +32,7 @@ pub enum JamError {
                                  // a solver cannot substitute mints after signing,
                                  // but an explicit on-chain check is cleaner than
                                  // relying solely on the taker signature.
-    HooksNotSupported,           // hooks_hash != [0u8;32]; beforeSettle/afterSettle not
+    HooksNotSupported,           // hooks_enabled == true; beforeSettle/afterSettle not
                                  // yet executed on Solana. Orders must use EMPTY_HOOKS_HASH.
                                  // Accepted and planned; currently rejected to prevent
                                  // silent no-op of hooks the taker believed would run.

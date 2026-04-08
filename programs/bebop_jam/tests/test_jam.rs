@@ -1880,9 +1880,9 @@ async fn test_jam_settle_fake_token_program_rejected() {
 
 #[tokio::test]
 async fn test_jam_settle_fee_no_account_goes_to_receiver() {
-    // If partner_info specifies a fee but partner_account is None, the fee
-    // must NOT be deducted from the receiver's output. Tokens must not get
-    // stuck in the custody PDA.
+    // If partner_fee_bps > 0 but partner_account is None, the fee must NOT
+    // be deducted from the receiver's output. Tokens must not get stuck in
+    // the custody PDA (STUCK-FUNDS GUARD).
     let env = prepare_jam_env().await;
     let nonce: u64 = 100;
     let solver = env.solver_kp.pubkey();

@@ -24,9 +24,6 @@ use anchor_spl::{
 pub const TEMPORARY_WSOL_TOKEN_ACCOUNT: &[u8] = b"temporary-wsol-token-account";
 pub const SHARED_ACCOUNT: &[u8] = b"shared-account";
 
-// CustomError was removed — it aliased BebopError codes at 6000, causing
-// test assertions to fail when both enums existed. All T22 checks now use
-// crate::error::BebopError::Token2022MintExtensionNotSupported directly.
 pub fn transfer<'info>(
     token_program: AccountInfo<'info>,
     from: AccountInfo<'info>,

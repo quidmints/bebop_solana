@@ -55,7 +55,7 @@
 // │        (no concurrent borrow), lamports <= sol_lamports (pool check),   │
 // │        optional max_flash_borrow_bps cap. Scans instructions sysvar to  │
 // │        confirm flash_repay discriminator exists later in this tx.       │
-// │        Zeros sol_usd_contrib (capacity stays conservative during loan). |
+// │        Zeros sol_usd_contrib (capacity stays conservative during loan). │
 // │        Sets bank.flash_lamports = borrowed. Transfers SOL to borrower.  │
 // │      interaction[i+1..j]: solver executes arb / fills with the SOL.     │
 // │      interaction[j+1] : quid::flash_repay { use_jam_authority: true }   │
@@ -71,15 +71,15 @@
 // │    receipt PDA needed.                                                  │
 // │    Flash loans are free for Bebop (no fee charged by FlashLoanProvider).
 // │                                                                         │
+// │    interaction (use_jam_authority: false) between borrow and repay.     │
+// │    JAM side: no changes — same use_jam_authority: true pattern.         │
 // └─────────────────────────────────────────────────────────────────────────┘
 //
 // ─── Fee flows ───────────────────────────────────────────────────────────────
-//   partnerFee  → partner_account (integration frontend; order.partner_info bits 48-63)
+//   partnerFee  → partner_account (integration frontend; order.partner_fee_bps)
 //   protocolFee → config.treasury (Bebop treasury; config.protocol_fee_bps, default 0)
 //                 treasury ≠ admin multisig — governance and revenue are separate keys.
-//   FlashLoanProvider        → no explicit JAM fee; Bebop earns the SOL/USD delta on flash repay.
 //
-// ─── A3/A4: Upgrade authority + admin key — see admin_timelock.rs ────────────
 // Both protected via Squads v4 (https://github.com/Squads-Protocol/v4).
 // Motivation, threat model, and step-by-step setup in admin_timelock.rs.
 //
@@ -95,11 +95,10 @@
 //      stronger than a detached EIP-712 signature: the tx commits to specific
 //      account pubkeys, amounts, and program IDs in one atomic unit. Permit2
 //      provides no additional security in this model.]
-//   - hooksHash — field present on SolanaJamOrder and validated in order hash;
-//     beforeSettle/afterSettle not yet executed (rejected if non-zero by
-//     require!(order.hooks_hash == [0u8;32])). Solvers use interaction ordering
-//     to achieve equivalent pre/post effects. Will be executed once hook
-//     programs exist. Currently rejects non-zero to prevent silent no-op.
+//   - hooksHash → hooks_enabled: bool on SolanaJamOrder (saves 31 bytes vs [u8;32]);
+//     beforeSettle/afterSettle not yet executed on Solana. hooks_enabled: true
+//     is rejected with HooksNotSupported rather than silently skipped — same
+//     guarantee as EVM where hooksHash must match executed hooks.
 //   - JamInteraction.value (ETH forward) — encode as explicit
 //     system_program::transfer CPI in interaction.data instead
 //     [Deliberately omitted — by design. Solana has no implicit ETH-forward
@@ -112,30 +111,29 @@
 //     per-settlement fees). Admins who activate protocol_fee_bps should
 //     note that only pair 0 contributes to the fee.
 //
-// partnerInfo bit layout diverges from EVM intentionally:
-//   EVM uint256: bits 0-15=protocolFee, bits 16-31=partnerFee, bits 32+=address
-//   Solana u64:  bits 48-63=partnerFeeBps; protocolFee is in JamConfig; address
-//   is a separate Option<Pubkey> field. Off-chain order builders must encode
-//   Solana orders with fee_bps << 48 (not << 16 as on EVM).
+// partnerInfo encoding diverges from EVM intentionally:
+//   EVM uint256: packed bits (0-15=protocolFee, 16-31=partnerFee, 32+=address)
+//   Solana: partner_fee_bps: u16 (direct, no packing), partner: Option<Pubkey>,
+//           protocolFee in JamConfig.protocol_fee_bps. Off-chain builders use
+//           the field directly — no bit-shifting required.
 //
 // remaining_accounts layout (off-chain solver populates):
 //   handle_settle:
-//     [0 .. (S-1)*4)      : additional sell pairs, S-1 groups of 4:
-//                           [taker_sell_ata, custody_sell_ata, sell_mint, sell_token_prog]
-//                           for native SOL: taker account, custody_authority, native_mint, system_program
-//     [(S-1)*4 .. (S-1)*4 + (B-1)*4) : additional buy pairs, B-1 groups of 4:
-//                           [custody_buy_ata, receiver_buy_ata, buy_mint, buy_token_prog]
-//                           for native SOL: custody_authority, receiver, native_mint, system_program
-//     [interaction_base ..) : all accounts referenced by interactions (searched by pubkey)
+//     [0 .. (S-1)*5)      : additional sell pairs, S-1 groups of 5:
+//                           [taker_sell_i, custody_sell_i, sell_mint_i, sell_prog_i, solver_sell_i]
+//                           native SOL: [taker_wallet, custody_auth, native_mint, sys_prog, solver_wallet]
+//     [(S-1)*5 .. (S-1)*5+(B-1)*4): additional buy pairs, B-1 groups of 4:
+//                           [custody_buy_i, receiver_buy_i, buy_mint_i, buy_prog_i]
+//                           native SOL: [custody_auth, receiver_wallet, native_mint, sys_prog]
+//     [interaction_base ..) : interaction accounts (found by pubkey; may overlap earlier slots)
 //
 //   handle_settle_internal:
 //     [0 .. (S-1)*4)      : additional sell pairs, S-1 groups of 4:
-//                           [taker_sell_ata, solver_sell_ata, sell_mint, sell_token_prog]
-//     [(S-1)*4 .. (S-1)*4 + (B-1)*4) : additional buy pairs, B-1 groups of 4:
-//                           [solver_buy_ata, receiver_buy_ata, buy_mint, buy_token_prog]
+//                           [taker_sell_i, solver_sell_i, sell_mint_i, sell_prog_i]
+//     [(S-1)*4 .. (S-1)*4+(B-1)*4): additional buy pairs, B-1 groups of 4:
+//                           [solver_buy_i, receiver_buy_i, buy_mint_i, buy_prog_i]
 //
 // where S = sell_tokens.len(), B = buy_tokens.len()
-// Because interactions are found by pubkey, they may overlap with earlier slots.
 
 use anchor_lang::{prelude::*, solana_program::program::{invoke, invoke_signed}};
 use anchor_spl::{
@@ -257,6 +255,8 @@ pub struct Settle<'info> {
     pub sell_token_program: Interface<'info, TokenInterface>,
     pub buy_token_program: Interface<'info, TokenInterface>,
 
+    /// Partner's ATA for the buy token (pair 0), or wallet for native SOL buy.
+    /// Required when order.partner_fee_bps > 0 and order.partner is set.
     #[account(mut)]
     pub partner_account: Option<AccountInfo<'info>>,
 
@@ -330,7 +330,7 @@ pub struct SettleInternal<'info> {
     pub system_program: Program<'info, System>,
 
     /// Partner's ATA for the buy token (pair 0), or wallet for native SOL buy.
-    /// If partner_info encodes a non-zero partner fee, this account receives it.
+    /// If order.partner_fee_bps > 0 and order.partner is set, this account receives the fee.
     #[account(mut)]
     pub partner_account: Option<AccountInfo<'info>>,
 
@@ -432,7 +432,6 @@ pub fn handle_settle<'c: 'info, 'info>(
         let custody_sell = &ctx.remaining_accounts[base + 1];
         let sell_mint_i = &ctx.remaining_accounts[base + 2];
         let sell_prog_i = &ctx.remaining_accounts[base + 3];
-        let solver_sell_i = &ctx.remaining_accounts[base + 4];
         // A9: reject fake token programs — a no-op transfer would let sell tokens
         // bypass custody, potentially leaving the sell-side unfunded.
         require!(
@@ -478,8 +477,6 @@ pub fn handle_settle<'c: 'info, 'info>(
             ctx.accounts.system_program.to_account_info(),
             None,
         )?;
-        // solver_sell_i (base+4) is used in the post-buy sell-drain loop below.
-        let _ = solver_sell_i; // referenced here to suppress unused-variable warning
     }
 
     // No pre-interaction snapshot needed. The custody authority PDA is derived
@@ -921,7 +918,7 @@ pub fn handle_settle_internal<'c: 'info, 'info>(
         None,
     )?;
 
-    // Partner fee for pair 0 (was previously computed and discarded).
+    // Partner fee for pair 0.
     if partner_fee_0 > 0 {
         if let Some(pa) = ctx.accounts.partner_account.as_ref() {
             // Same validation as handle_settle.partner_account.
@@ -1275,7 +1272,7 @@ fn balance_of<'info>(
 //        == true and can gate on key() == its stored bebop_authority pubkey.
 //        This is exactly require(msg.sender == JAM) on EVM, implemented without
 //        any compile-time binding: JAM knows nothing about the callee; the
-//        callee registers the expected pubkey once (QU!D: update_config with
+//        callee registers the expected pubkey once (FlashLoanProvider: update_config with
 //        set_bebop_authority = jam_authority.key()).
 //
 //        Flash loan example — solver includes in interactions[]:
@@ -1288,9 +1285,9 @@ fn balance_of<'info>(
 //            sol_risk, sol_pool, config, system_program],
 //            data: flash_repay_discriminator,
 //            use_jam_authority: true, result: true }
-//        JAM dispatches each with invoke_signed; QU!D's signer + address
+//        JAM dispatches each with invoke_signed; FlashLoanProvider's signer + address
 //        constraint on flash_authority passes for both instructions.
-//        QU!D's instructions sysvar lookahead at borrow time confirms
+//        FlashLoanProvider's instructions sysvar lookahead at borrow time confirms
 //        flash_repay is present later in the same tx — atomicity at the
 //        Solana transaction level, stronger than EVM's end-of-call check.
 //
@@ -1379,7 +1376,7 @@ fn run_interactions<'info>(
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Compute (net_amount, fee) for a given gross amount and fee in bps.
-/// partner_fee_bps is now stored directly in SolanaJamOrder (was packed into u64).
+/// partner_fee_bps is stored directly in SolanaJamOrder as a u16 (no bit-packing).
 fn decode_partner_fee(amount: u64, partner_fee_bps: u16) -> Result<(u64, u64)> {
     let bps = partner_fee_bps as u64;
     if bps == 0 { return Ok((amount, 0)); }
