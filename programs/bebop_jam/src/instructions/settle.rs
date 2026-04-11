@@ -1,139 +1,64 @@
 
+// ─── JAM Settlement — Solana ─────────────────────────────────────────────────
 //
-// Batch settle: not implemented.
-// On Solana, atomicity across multiple orders is free — pack multiple settle
-// instructions into one transaction. No program-level loop needed.
-// [Deliberately omitted — by design. EVM settleBatch() exists only to amortise
-//  gas across orders; Solana has no equivalent per-instruction overhead.]
-
+// settleBatch: not implemented.
+// Pack multiple settle instructions into one transaction — atomicity is free.
+//
 // settleBebopBlend: not implemented.
-// On EVM this is a hardcoded binding to BebopSettlement.sol.
-// On Solana, solvers route through bebop_rfq by including a bebop_rfq::Swap
-// instruction as a SolanaInteraction entry in the normal settle() flow.
-// Any program is reachable through interactions — no dedicated entrypoint needed.
-// [Deliberately omitted — by design. More general than EVM: no address hardcoding.]
-// ---------------------------------------------------------------------------
-// │  RFQ array asymmetry:                                                   │
-// │    BebopSettlement.swapMulti() handles taker_tokens[]/maker_tokens[]    │
-// │    in one EVM call. The Solana RFQ (bebop_rfq) achieves the same result │
-// │    by chaining Swap instructions sharing the shared_pda intermediate.   │
-// │    JAM (both chains) uses arrays in one call — EVM via calldata, Solana │
-// │    via remaining_accounts. Atomicity is identical either way.           │
-// │                                                                         │
-// │  AmountWithExpiry (Solana RFQ only):                                    │
-// │    bebop_rfq::handle_swap takes Vec<AmountWithExpiry> — a degrading     │
-// │    quote ladder. BebopSettlement.sol uses a single maker_amount.        │
-// │    This is a Solana PMM extension; JAM does not use it.                 │
-// │    When a solver routes a JAM interaction through bebop_rfq, they pass  │
-// │    AmountWithExpiry in the interaction data.                            │
-// │                                                                         │
-// │  Blend path (JAM → RFQ):                                                │
-// │    EVM: JamSettlement.settleBebopBlend() calls BebopSettlement at a     │
-// │    hardcoded immutable address.                                         │
-// │    Solana: solver adds bebop_rfq::Swap as a SolanaInteraction entry.    │
-// │    run_interactions dispatches it with plain invoke — the RFQ maker     │
-// │    is the signer on that sub-instruction, not JAM. More general than    │
-// │    EVM: any program is reachable without an explicit binding.           │
-// │                                                                         │
-// │  Flash loan (SOL only; SPL requires separate per-token vault design):   │
-// │    EVM: flashLoan provider gates on require(msg.sender == JAM).         │
-// │                                                                         │
-// │    Solana mechanism:                                                    │
-// │      Solver sets use_jam_authority: true on flash_borrow and            │
-// │      flash_repay SolanaInteraction entries. run_interactions calls      │
-// │      invoke_signed with JAM_AUTHORITY_SEED, so FlashLoanProvider's CPI context has
-// │      flash_authority.is_signer == true. FlashLoanProvider's FlashBorrow constrains
-// │      flash_authority: (1) signer, (2) key == config.bebop_authority.    │
-// │      Only a JAM invoke_signed satisfies both. Equivalent to             │
-// │      require(msg.sender == JAM) on EVM. Zero compile-time binding:      │
-// │      JAM has no knowledge of FlashLoanProvider's instruction layout; FlashLoanProvider stores
-// │      the expected pubkey once via update_config(set_bebop_authority).   │
-// │                                                                         │
-// │    Execution sequence (all in one settle() call, single Solana tx):     │
-// │      interaction[i]   : quid::flash_borrow { use_jam_authority: true }  │
-// │        FlashLoanProvider checks: signer + address constraint, flash_lamports == 0
-// │        (no concurrent borrow), lamports <= sol_lamports (pool check),   │
-// │        optional max_flash_borrow_bps cap. Scans instructions sysvar to  │
-// │        confirm flash_repay discriminator exists later in this tx.       │
-// │        Zeros sol_usd_contrib (capacity stays conservative during loan). │
-// │        Sets bank.flash_lamports = borrowed. Transfers SOL to borrower.  │
-// │      interaction[i+1..j]: solver executes arb / fills with the SOL.     │
-// │      interaction[j+1] : quid::flash_repay { use_jam_authority: true }   │
-// │        Repayer (solver) transfers principal back to sol_pool.           │
-// │        Clears bank.flash_lamports. Restores sol_usd_contrib at live     │
-// │        SOL/USD price (delta accrues to protocol conservatively).        │
-// │                                                                         │
-// │    Atomicity: Solana reverts all state on any failure — if the loan is  │
-// │    not repaid the entire settle tx rolls back. FlashLoanProvider's instructions
-// │    sysvar lookahead at borrow time gives a stronger guarantee than EVM  │
-// │    (EVM only discovers missing repayment at end-of-call). The           │
-// │    bank.flash_lamports == 0 guard prevents concurrent borrows; no       │
-// │    receipt PDA needed.                                                  │
-// │    Flash loans are free for Bebop (no fee charged by FlashLoanProvider).
-// │                                                                         │
-// │    interaction (use_jam_authority: false) between borrow and repay.     │
-// │    JAM side: no changes — same use_jam_authority: true pattern.         │
-// └─────────────────────────────────────────────────────────────────────────┘
+// Solver includes bebop_rfq::Swap as a SolanaInteraction entry. Any program
+// is reachable through interactions — no dedicated entrypoint needed.
 //
-// ─── Fee flows ───────────────────────────────────────────────────────────────
-//   partnerFee  → partner_account (integration frontend; order.partner_fee_bps)
-//   protocolFee → config.treasury (Bebop treasury; config.protocol_fee_bps, default 0)
-//                 treasury ≠ admin multisig — governance and revenue are separate keys.
+// ─── Flash loans ─────────────────────────────────────────────────────────────
+// Gated by use_jam_authority: true on flash_borrow / flash_repay interaction
+// entries. run_interactions calls invoke_signed with JAM_AUTHORITY_SEED, so
+// FlashLoanProvider's FlashBorrow constraint (signer + address == config.bebop_authority)
+// is satisfied only via JAM. Zero compile-time binding — FlashLoanProvider stores the
+// expected pubkey once via update_config(set_bebop_authority).
 //
-// Both protected via Squads v4 (https://github.com/Squads-Protocol/v4).
-// Motivation, threat model, and step-by-step setup in admin_timelock.rs.
+// Execution sequence (all within one settle() call):
+//   interaction[i]     : quid::flash_borrow { use_jam_authority: true }
+//   interaction[i+1..j]: solver-defined — JAM has no knowledge of these
+//   interaction[j+1]   : quid::flash_repay { use_jam_authority: true }
 //
-// Scope parity with EVM JamSettlement.sol:
-//   - settle / settleInternal — full parity including multi-pair and fees
-//   - settleBatch — not needed: pack multiple settle instructions in one tx
-//     [Deliberately omitted — by design; see above]
-//   - settleBebopBlend — not needed: solver includes bebop_rfq::Swap as a
-//     SolanaInteraction entry with plain invoke (no JAM authority required)
-//     [Deliberately omitted — by design; see above]
-//   - usingPermit2 — not needed: taker co-signs the Solana transaction
-//     [Deliberately omitted — by design. Taker co-signing the tx is strictly
-//      stronger than a detached EIP-712 signature: the tx commits to specific
-//      account pubkeys, amounts, and program IDs in one atomic unit. Permit2
-//      provides no additional security in this model.]
-//   - hooksHash → hooks_enabled: bool on SolanaJamOrder (saves 31 bytes vs [u8;32]);
-//     beforeSettle/afterSettle not yet executed on Solana. hooks_enabled: true
-//     is rejected with HooksNotSupported rather than silently skipped — same
-//     guarantee as EVM where hooksHash must match executed hooks.
-//   - JamInteraction.value (ETH forward) — encode as explicit
-//     system_program::transfer CPI in interaction.data instead
-//     [Deliberately omitted — by design. Solana has no implicit ETH-forward
-//      equivalent; making the transfer explicit in interaction.data is safer.]
-//   - protocol fee — deducted from gross buy amount and forwarded to
-//     config.treasury via treasury_buy_ata (pair 0 only). Additional buy
-//     pairs transfer the full received amount to the receiver without a
-//     protocol fee deduction. This is intentional: protocol_fee_bps defaults
-//     to 0 on Solana (Bebop revenue flows through FlashLoanProvider kickback, not JAM
-//     per-settlement fees). Admins who activate protocol_fee_bps should
-//     note that only pair 0 contributes to the fee.
+// Solana reverts all state on any failure. Sysvar lookahead in flash_borrow
+// confirms flash_repay exists later in the same transaction.
+// Flash loans are free — no fee charged by FlashLoanProvider.
 //
-// partnerInfo encoding diverges from EVM intentionally:
-//   EVM uint256: packed bits (0-15=protocolFee, 16-31=partnerFee, 32+=address)
-//   Solana: partner_fee_bps: u16 (direct, no packing), partner: Option<Pubkey>,
-//           protocolFee in JamConfig.protocol_fee_bps. Off-chain builders use
-//           the field directly — no bit-shifting required.
+// SPL path: token_amount > 0 triggers remaining_accounts vault transfer.
+// Blocked interaction targets: system_program, spl_token, spl_token_2022,
+// and JAM itself (re-entrancy). All other programs are solver-defined.
 //
-// remaining_accounts layout (off-chain solver populates):
+// ─── Fees ────────────────────────────────────────────────────────────────────
+//   partnerFee  → partner_account (order.partner_fee_bps)
+//   protocolFee → config.treasury (config.protocol_fee_bps, default 0)
+//                 pair 0 only; treasury ≠ admin multisig
+//   FlashLoanProvider        → no explicit JAM fee; protocol earns SOL/USD delta on repay
+//
+// ─── Admin / upgrade authority — see admin_timelock.rs ───────────────────────
+//
+// ─── Scope divergence from EVM JamSettlement.sol ─────────────────────────────
+//   usingPermit2       — not needed: taker co-signs the Solana tx (strictly
+//                        stronger than EIP-712; tx commits to accounts + amounts)
+//   hooksHash          — hooks_enabled: bool; hooks_enabled: true rejected with
+//                        HooksNotSupported rather than silently skipped
+//   JamInteraction.value — encode as explicit system_program::transfer CPI
+//   partnerInfo        — partner_fee_bps: u16 direct field, no uint256 packing
+//
+// ─── remaining_accounts layout ───────────────────────────────────────────────
 //   handle_settle:
-//     [0 .. (S-1)*5)      : additional sell pairs, S-1 groups of 5:
-//                           [taker_sell_i, custody_sell_i, sell_mint_i, sell_prog_i, solver_sell_i]
-//                           native SOL: [taker_wallet, custody_auth, native_mint, sys_prog, solver_wallet]
-//     [(S-1)*5 .. (S-1)*5+(B-1)*4): additional buy pairs, B-1 groups of 4:
-//                           [custody_buy_i, receiver_buy_i, buy_mint_i, buy_prog_i]
-//                           native SOL: [custody_auth, receiver_wallet, native_mint, sys_prog]
-//     [interaction_base ..) : interaction accounts (found by pubkey; may overlap earlier slots)
+//     [0 .. (S-1)*5)           : additional sell pairs, groups of 5:
+//                                [taker_sell, custody_sell, sell_mint, sell_prog, solver_sell]
+//     [(S-1)*5 .. +(B-1)*4)    : additional buy pairs, groups of 4:
+//                                [custody_buy, receiver_buy, buy_mint, buy_prog]
+//     [interaction_base ..)    : interaction accounts (may overlap earlier slots)
 //
 //   handle_settle_internal:
-//     [0 .. (S-1)*4)      : additional sell pairs, S-1 groups of 4:
-//                           [taker_sell_i, solver_sell_i, sell_mint_i, sell_prog_i]
-//     [(S-1)*4 .. (S-1)*4+(B-1)*4): additional buy pairs, B-1 groups of 4:
-//                           [solver_buy_i, receiver_buy_i, buy_mint_i, buy_prog_i]
+//     [0 .. (S-1)*4)           : additional sell pairs, groups of 4:
+//                                [taker_sell, solver_sell, sell_mint, sell_prog]
+//     [(S-1)*4 .. +(B-1)*4)    : additional buy pairs, groups of 4:
+//                                [solver_buy, receiver_buy, buy_mint, buy_prog]
 //
-// where S = sell_tokens.len(), B = buy_tokens.len()
+//   S = sell_tokens.len(), B = buy_tokens.len()
 
 use anchor_lang::{prelude::*, solana_program::program::{invoke, invoke_signed}};
 use anchor_spl::{
@@ -163,7 +88,7 @@ pub struct Settle<'info> {
     #[account(mut)]
     pub solver: Signer<'info>,
 
-    /// Taker co-signs — equivalent of EIP-712 sig verification on EVM.
+    /// Taker co-signs the transaction — commits to all accounts and amounts.
     /// mut required: native-SOL sell path uses system_program::transfer {from: taker, to: custody},
     /// and native-SOL buy path uses system_program::transfer {from: custody, to: taker/receiver}.
     /// system_program::transfer requires both from AND to to be writable.
@@ -591,7 +516,7 @@ pub fn handle_settle<'c: 'info, 'info>(
             // Use ATA presence as discriminator (matches transfer_from_custody routing):
             // custody_buy_ata.is_some() = token account path (SPL, T22, or wSOL).
             // custody_buy_ata.is_none() = native SOL lamport path.
-            // The old check used buy_tokens[0] != native_mint which incorrectly
+            // native_mint check:
             // sent wSOL buys (native_mint + Some ATA) to the wallet-address branch.
             if ctx.accounts.custody_buy_ata.is_some() {
                 use anchor_lang::solana_program::program_pack::Pack;
@@ -739,9 +664,8 @@ pub fn handle_settle<'c: 'info, 'info>(
     }
 
     // ── Drain sell tokens: custody → solver ─────────────────────────────────────
-    // EVM parity: JamSettlement transfers sell tokens to msg.sender (solver) after
-    // interactions. Doing this AFTER buy verification ensures the solver cannot
-    // receive sell tokens without having delivered the buy tokens.
+    // Sell tokens transferred to solver AFTER interactions. Doing this after
+    // buy verification ensures the solver cannot receive sell tokens without having delivered the buy tokens.
     // For SPL/wSOL sell (custody_sell_ata.is_some()), solver_sell_ata must also
     // be Some — otherwise transfer_from_custody panics on recipient_ata.unwrap().
     require!(
@@ -1270,7 +1194,7 @@ fn balance_of<'info>(
 //      use_jam_authority: true  →  invoke_signed appends jam_authority and
 //        signs with JAM_AUTHORITY_SEED. The callee sees jam_authority.is_signer
 //        == true and can gate on key() == its stored bebop_authority pubkey.
-//        This is exactly require(msg.sender == JAM) on EVM, implemented without
+//        Equivalent to require(msg.sender == JAM): PDA cannot be forged,
 //        any compile-time binding: JAM knows nothing about the callee; the
 //        callee registers the expected pubkey once (FlashLoanProvider: update_config with
 //        set_bebop_authority = jam_authority.key()).
@@ -1289,7 +1213,7 @@ fn balance_of<'info>(
 //        constraint on flash_authority passes for both instructions.
 //        FlashLoanProvider's instructions sysvar lookahead at borrow time confirms
 //        flash_repay is present later in the same tx — atomicity at the
-//        Solana transaction level, stronger than EVM's end-of-call check.
+//        and sysvar lookahead confirms repay before funds leave.
 //
 //      use_jam_authority: false →  plain invoke. DEX swaps, token transfers,
 //        oracle reads, bebop_rfq::Swap — any interaction not requiring JAM's
